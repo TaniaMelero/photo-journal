@@ -2,7 +2,7 @@
 
 App móvil para **tomar fotos** y guardarlas en una **galería local** junto con la **ubicación** donde fueron tomadas.
 
-Probado con **Expo SDK 54**.
+https://expo.dev – Probado con **Expo SDK 54**.
 
 ## ✨ Funcionalidades
 - Cámara integrada (captura y vista previa).
@@ -19,5 +19,5 @@ Probado con **Expo SDK 54**.
 - `@react-native-async-storage/async-storage`
 
 ## 📦 Instalación
-```bash
+```bash 
 npm install

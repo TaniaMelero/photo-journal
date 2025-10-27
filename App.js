@@ -1,154 +1,174 @@
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
+  StyleSheet,
   TouchableOpacity,
   FlatList,
   Image,
-  SafeAreaView,
-  StyleSheet,
+  ActivityIndicator,
+  Alert,
+  Platform,
+  StatusBar,
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Location from "expo-location";
-import * as FileSystem from "expo-file-system/legacy";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as FileSystem from "expo-file-system/legacy";
+import MapView, { Marker } from "react-native-maps";
 
-const storageKey = "PJ:photos";
+const STORAGE_KEY = "photo-journal:items";
 
 export default function App() {
-  const [tab, setTab] = useState("gallery"); // "gallery" | "camera"
-  const [items, setItems] = useState([]);
+  const [tab, setTab] = useState("gallery"); // "gallery" | "camera" | "map"
+  const [items, setItems] = useState([]); // [{ uri, lat?, lon?, ts }]
   const [saving, setSaving] = useState(false);
 
+  const cameraRef = useRef(null);
   const [camPerm, requestCamPerm] = useCameraPermissions();
-  const camRef = useRef(null);
 
-  // Cargar galería guardada
   useEffect(() => {
     (async () => {
       try {
-        const raw = await AsyncStorage.getItem(storageKey);
+        const raw = await AsyncStorage.getItem(STORAGE_KEY);
         if (raw) setItems(JSON.parse(raw));
       } catch {}
     })();
   }, []);
 
-  // Pedir permisos al abrir cámara
-  useEffect(() => {
-    if (tab !== "camera") return;
-    (async () => {
-      try {
-        if (!camPerm?.granted) await requestCamPerm();
+  async function persist(newItems) {
+    setItems(newItems);
+    try {
+      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(newItems));
+    } catch {}
+  }
 
-        const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== "granted") {
-          console.warn("Permiso de ubicación denegado");
-        }
-      } catch (e) {
-        console.warn(e);
+  async function ensurePermissions() {
+    if (!camPerm?.granted) {
+      const { granted } = await requestCamPerm();
+      if (!granted) {
+        Alert.alert("Permiso requerido", "Habilitá el permiso de cámara.");
+        return false;
       }
-    })();
-  }, [tab]);
+    }
+    const loc = await Location.requestForegroundPermissionsAsync();
+    if (loc.status !== "granted") {
+      Alert.alert(
+        "Ubicación denegada",
+        "Podés continuar sin ubicación, pero no se guardará el lugar."
+      );
+    }
+    return true;
+  }
 
-  async function takePhoto() {
-    if (!camRef.current || saving) return;
+  async function handleTakePhoto() {
+    if (!(await ensurePermissions())) return;
+
     try {
       setSaving(true);
-      const photo = await camRef.current.takePictureAsync({ quality: 0.8 });
 
-      // Intentar ubicación (opcional)
-      let coords = { lat: undefined, lon: undefined };
+      const cam = cameraRef.current;
+      if (!cam) return;
+
+      const result = await cam.takePictureAsync({ quality: 0.8, exif: false });
+
+      const filename = `photo_${Date.now()}.jpg`;
+      const dest = FileSystem.documentDirectory + filename;
+
+      await FileSystem.copyAsync({ from: result.uri, to: dest });
+
+      let lat, lon;
       try {
         const pos = await Location.getCurrentPositionAsync({});
-        coords = {
-          lat: pos.coords.latitude,
-          lon: pos.coords.longitude,
-        };
-      } catch {
-        // puede fallar si no hay permiso/GPS
-      }
+        lat = pos.coords.latitude;
+        lon = pos.coords.longitude;
+      } catch {}
 
-      // Copiar al sandbox de la app (persistencia)
-      const fileName = `${Date.now()}.jpg`;
-      const dest = FileSystem.documentDirectory + fileName;
-      await FileSystem.copyAsync({ from: photo.uri, to: dest });
-
-      const entry = {
-        uri: dest,
-        ts: Date.now(),
-        ...coords,
-      };
-
-      const next = [entry, ...items];
-      setItems(next);
-      await AsyncStorage.setItem(storageKey, JSON.stringify(next));
+      const entry = { uri: dest, lat, lon, ts: Date.now() };
+      const newItems = [entry, ...items];
+      await persist(newItems);
 
       setTab("gallery");
     } catch (e) {
-      console.warn("Error al tomar/guardar foto:", e);
+      Alert.alert("Error al guardar", String(e));
     } finally {
       setSaving(false);
     }
   }
 
-  async function deletePhoto(uriToDelete) {
-    try {
-      // 1) Borrar archivo (idempotente = no falla si ya no existe)
-      await FileSystem.deleteAsync(uriToDelete, { idempotent: true });
+  async function handleDeletePhoto(ts) {
+    const item = items.find((i) => i.ts === ts);
+    if (!item) return;
 
-      // 2) Actualizar estado y persistencia
-      const next = items.filter((p) => p.uri !== uriToDelete);
-      setItems(next);
-      await AsyncStorage.setItem(storageKey, JSON.stringify(next));
-    } catch (e) {
-      console.warn("Error al eliminar la foto:", e);
-    }
+    try {
+      // borrá el archivo si existe
+      const info = await FileSystem.getInfoAsync(item.uri);
+      if (info.exists) {
+        await FileSystem.deleteAsync(item.uri, { idempotent: true });
+      }
+    } catch {}
+
+    const newItems = items.filter((i) => i.ts !== ts);
+    await persist(newItems);
   }
 
   function renderItem({ item }) {
-    const date = new Date(item.ts);
     return (
       <View style={styles.card}>
         <Image source={{ uri: item.uri }} style={styles.photo} />
-        <View style={styles.cardFooter}>
-          <Text style={styles.date}>
-            {date.toLocaleDateString()} {date.toLocaleTimeString()}
-          </Text>
-
-          <View style={styles.footerRow}>
-            <Text style={styles.coords}>
-              📍{" "}
-              {item.lat != null && item.lon != null
-                ? `${item.lat.toFixed(5)}, ${item.lon.toFixed(5)}`
-                : "sin ubicación"}
+        <View style={styles.meta}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.metaTitle}>
+              {new Date(item.ts).toLocaleString()}
             </Text>
-
-            <TouchableOpacity
-              onPress={() => deletePhoto(item.uri)}
-              style={styles.deleteBtn}
-            >
-              <Text style={styles.deleteLabel}>Eliminar</Text>
-            </TouchableOpacity>
+            <Text style={styles.metaSub}>
+              {item.lat && item.lon
+                ? `📍 ${item.lat.toFixed(5)}, ${item.lon.toFixed(5)}`
+                : "Sin ubicación"}
+            </Text>
           </View>
+          <TouchableOpacity
+            onPress={() =>
+              Alert.alert(
+                "Eliminar",
+                "¿Querés borrar esta foto?",
+                [
+                  { text: "Cancelar", style: "cancel" },
+                  { text: "Borrar", style: "destructive", onPress: () => handleDeletePhoto(item.ts) },
+                ],
+                { cancelable: true }
+              )
+            }
+            style={styles.deleteBtn}
+          >
+            <Text style={{ color: "#fff", fontWeight: "700" }}>Borrar</Text>
+          </TouchableOpacity>
         </View>
       </View>
     );
   }
 
+  const firstWithGPS = items.find((i) => i.lat && i.lon);
+  const initialRegion = {
+    latitude: firstWithGPS?.lat ?? -34.6,
+    longitude: firstWithGPS?.lon ?? -58.38,
+    latitudeDelta: 0.2,
+    longitudeDelta: 0.2,
+  };
+
   return (
-    <SafeAreaView style={styles.safe}>
+    <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.title}>Photo Journal</Text>
-
         <View style={styles.tabs}>
           <TouchableOpacity
             onPress={() => setTab("gallery")}
-            style={[styles.tabBtn, tab === "gallery" && styles.tabBtnActive]}
+            style={[styles.tabBtn, tab === "gallery" && styles.tabActive]}
           >
             <Text
               style={[
-                styles.tabLabel,
-                tab === "gallery" && styles.tabLabelActive,
+                styles.tabText,
+                tab === "gallery" && styles.tabTextActive,
               ]}
             >
               Galería
@@ -157,139 +177,164 @@ export default function App() {
 
           <TouchableOpacity
             onPress={() => setTab("camera")}
-            style={[styles.tabBtn, tab === "camera" && styles.tabBtnActive]}
+            style={[styles.tabBtn, tab === "camera" && styles.tabActive]}
           >
             <Text
-              style={[
-                styles.tabLabel,
-                tab === "camera" && styles.tabLabelActive,
-              ]}
+              style={[styles.tabText, tab === "camera" && styles.tabTextActive]}
             >
               Cámara
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={() => setTab("map")}
+            style={[styles.tabBtn, tab === "map" && styles.tabActive]}
+          >
+            <Text
+              style={[styles.tabText, tab === "map" && styles.tabTextActive]}
+            >
+              Mapa
             </Text>
           </TouchableOpacity>
         </View>
       </View>
 
-      {tab === "camera" ? (
+      {tab === "gallery" ? (
+        items.length === 0 ? (
+          <View style={styles.empty}>
+            <Text style={styles.emptyText}>
+              Aún no hay fotos. ¡Abrí la cámara!
+            </Text>
+          </View>
+        ) : (
+          <FlatList
+            data={items}
+            keyExtractor={(it) => String(it.ts)}
+            renderItem={renderItem}
+            contentContainerStyle={{ padding: 12, paddingBottom: 120 }}
+          />
+        )
+      ) : tab === "camera" ? (
         <View style={{ flex: 1 }}>
           {camPerm?.granted ? (
-            <>
-              <CameraView ref={camRef} style={{ flex: 1 }} facing="back" />
-              <View style={styles.snapBar}>
-                <TouchableOpacity
-                  onPress={takePhoto}
-                  disabled={saving}
-                  style={[styles.snapBtn, saving && { opacity: 0.6 }]}
-                >
-                  <Text style={styles.snapLabel}>
-                    {saving ? "Guardando..." : "Tomar foto"}
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            </>
+            <CameraView
+              ref={cameraRef}
+              style={{ flex: 1 }}
+              facing="back"
+              enableZoomGesture
+            />
           ) : (
-            <View style={styles.center}>
-              <Text style={{ color: "#ccc", marginBottom: 12 }}>
-                Sin permiso de cámara
+            <View style={styles.empty}>
+              <Text style={styles.emptyText}>
+                Concedé permiso de cámara para continuar.
               </Text>
-              <TouchableOpacity
-                onPress={requestCamPerm}
-                style={styles.requestBtn}
-              >
-                <Text style={{ color: "white", fontWeight: "600" }}>
-                  Pedir permiso
-                </Text>
-              </TouchableOpacity>
             </View>
           )}
+
+          <View style={styles.shutterWrap}>
+            <TouchableOpacity
+              onPress={handleTakePhoto}
+              disabled={saving}
+              style={styles.shutter}
+            >
+              {saving ? (
+                <ActivityIndicator color="#000" />
+              ) : (
+                <View style={styles.shutterInner} />
+              )}
+            </TouchableOpacity>
+          </View>
         </View>
       ) : (
-        <FlatList
-          data={items}
-          keyExtractor={(p) => p.uri}
-          renderItem={renderItem}
-          contentContainerStyle={{ padding: 16, paddingBottom: 40 }}
-          ListEmptyComponent={
-            <View style={styles.center}>
-              <Text style={{ color: "#888" }}>
-                Aún no hay fotos. ¡Abrí la cámara!
-              </Text>
-            </View>
-          }
-        />
+        <MapView style={{ flex: 1 }} initialRegion={initialRegion}>
+          {items
+            .filter((i) => i.lat && i.lon)
+            .map((it) => (
+              <Marker
+                key={it.ts}
+                coordinate={{ latitude: it.lat, longitude: it.lon }}
+                title={new Date(it.ts).toLocaleString()}
+                description={it.uri}
+              />
+            ))}
+        </MapView>
       )}
-    </SafeAreaView>
+    </View>
   );
 }
 
+const HEADER_TOP =
+  Platform.OS === "android" ? StatusBar.currentHeight ?? 24 : 0;
+
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: "#000" },
+  container: { flex: 1, backgroundColor: "#000" },
   header: {
+    paddingTop: HEADER_TOP,
     paddingHorizontal: 16,
-    paddingTop: 6,
-    paddingBottom: 10,
+    paddingBottom: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
     backgroundColor: "#000",
   },
-  title: { color: "white", fontSize: 22, fontWeight: "700", marginBottom: 10 },
-  tabs: { flexDirection: "row", gap: 10 },
+  title: { color: "#fff", fontSize: 18, fontWeight: "700" },
+  tabs: { flexDirection: "row", gap: 8 },
   tabBtn: {
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 16,
-    backgroundColor: "#1c1c1c",
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 12,
+    backgroundColor: "#222",
   },
-  tabBtnActive: { backgroundColor: "#5b3df5" },
-  tabLabel: { color: "#bdbdbd", fontWeight: "600" },
-  tabLabelActive: { color: "white" },
+  tabActive: { backgroundColor: "#5B3DF5" },
+  tabText: { color: "#aaa", fontWeight: "600" },
+  tabTextActive: { color: "#fff" },
+
+  empty: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 24,
+  },
+  emptyText: { color: "#aaa" },
 
   card: {
+    backgroundColor: "#111",
     borderRadius: 12,
     overflow: "hidden",
-    backgroundColor: "#141414",
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: "#222",
+    marginBottom: 12,
   },
-  photo: { width: "100%", height: 260, backgroundColor: "#111" },
-  cardFooter: { padding: 12 },
-  date: { color: "white", fontWeight: "700", marginBottom: 6 },
-  footerRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: 12,
-  },
-  coords: { color: "#aaa", fontSize: 12 },
-
+  photo: { width: "100%", height: 240, backgroundColor: "#222" },
+  meta: { padding: 12, gap: 8, flexDirection: "row", alignItems: "center" },
+  metaTitle: { color: "#fff", fontWeight: "700" },
+  metaSub: { color: "#bbb" },
   deleteBtn: {
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    backgroundColor: "#2a2a2a",
-    borderRadius: 8,
+    backgroundColor: "#E5484D",
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 10,
   },
-  deleteLabel: { color: "#ff6b6b", fontWeight: "700" },
 
-  snapBar: {
+  shutterWrap: {
     position: "absolute",
-    bottom: 26,
+    bottom: 28,
     left: 0,
     right: 0,
     alignItems: "center",
   },
-  snapBtn: {
-    backgroundColor: "#5b3df5",
-    paddingVertical: 14,
-    paddingHorizontal: 28,
-    borderRadius: 40,
+  shutter: {
+    width: 76,
+    height: 76,
+    borderRadius: 999,
+    backgroundColor: "#fff",
+    alignItems: "center",
+    justifyContent: "center",
   },
-  snapLabel: { color: "white", fontWeight: "700", fontSize: 16 },
-
-  center: { flex: 1, alignItems: "center", justifyContent: "center" },
-  requestBtn: {
-    backgroundColor: "#5b3df5",
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 10,
+  shutterInner: {
+    width: 58,
+    height: 58,
+    borderRadius: 999,
+    borderWidth: 4,
+    borderColor: "#000",
+    backgroundColor: "#fff",
   },
 });
